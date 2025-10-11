@@ -1,167 +1,196 @@
-module.exports = function(RED) {
-    const kafka = require('kafka-node');
+"use strict";
 
+const ConsumerGroup = require('kafka-node').ConsumerGroup;
+const kafka = require('kafka-node');
+
+module.exports = function(RED) {
     function KafkaConsumerNode(config) {
         RED.nodes.createNode(this, config);
         const node = this;
 
-        // ---- runtime state ----
-        node._group = null;       // kafka ConsumerGroup instance
-        node._activeCfg = null;   // last effective cfg used to build consumer
+        node._interval = null;
+        node._gen = 0; // increases each (re)build; handlers check this to avoid stale emits
+
+        // Configured kafka broker node
+        node.broker = RED.nodes.getNode(config.broker);
+        node.name = config.name;
+        node.topic = config.topic;
+        node.groupid = config.groupid;
+        node.fromOffset = config.fromOffset || "latest";
+        node.outOfRangeOffset = config.outOfRangeOffset || "earliest";
+        node.minbytes = config.minbytes || 1;
+        node.maxbytes = config.maxbytes || 1024 * 1024;
+        node.encoding = config.encoding || "utf8";
+
+        // Runtime state
         node._ready = false;
         node._lastMessageTs = null;
-        node._interval = null;
+        node._activeCfg = null;
+        node._group = null;
 
-        // ---- helpers ----
-        function uuid4() {
-            let u = '', i = 0;
-            while (i++ < 36) {
-                const c = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'[i - 1];
-                const r = Math.random() * 16 | 0;
-                const v = c === 'x' ? r : (r & 0x3 | 0x8);
-                u += (c === '-' || c === '4') ? c : v.toString(16);
+        // Helpers
+        function shallowEqual(a, b) {
+            if (a === b) return true;
+            if (!a || !b) return false;
+            const aKeys = Object.keys(a);
+            const bKeys = Object.keys(b);
+            if (aKeys.length !== bKeys.length) return false;
+            for (let k of aKeys) {
+                if (a[k] !== b[k]) return false;
             }
-            return u;
+            return true;
         }
-        function safeStatus(obj){ try { node.status(obj || {}); } catch(_){} }
-        function coerceNumber(n, defVal){ const v = Number(n); return Number.isFinite(v) ? v : defVal; }
-        function shallowEqual(a,b){ try { return JSON.stringify(a||null) === JSON.stringify(b||null); } catch { return false; } }
 
-        // Build effective config (msg first)
-        function resolveCfg(msg){
-            const mcfg = (msg && msg.kafkaCfg) || {};
-
-            // editor broker fallback (optional)
-            let brokerOptions = null;
-            if (config.broker) {
-                const brokerNode = RED.nodes.getNode(config.broker);
-                if (brokerNode && typeof brokerNode.getOptions === 'function') {
-                    try { brokerOptions = brokerNode.getOptions(); } catch(_){}
+        function normalizeKafkaHost(mcfg, brokerOptions){
+            // Accept common aliases and array/object forms
+            const pick = (v) => {
+                if (!v) return null;
+                if (typeof v === 'string') return v.trim() || null;
+                if (Array.isArray(v)) return v.filter(Boolean).join(',') || null;
+                if (typeof v === 'object') {
+                    if (Array.isArray(v.list)) return v.list.filter(Boolean).join(',') || null;
+                    if (Array.isArray(v.brokers)) return v.brokers.filter(Boolean).join(',') || null;
                 }
-            }
-
-            // Merge order: brokerOptions <- mcfg.kafkaClientOptions, then explicit mcfg.kafkaHost overrides
-            const clientOpts = Object.assign({}, brokerOptions, mcfg.kafkaClientOptions || {});
-            if (mcfg.kafkaHost) clientOpts.kafkaHost = mcfg.kafkaHost; // highest priority
-
-            const topic = (msg && (msg.topic ?? (msg.payload && msg.payload.topic))) ?? mcfg.topic ?? config.topic;
-            const groupId = mcfg.groupId ?? config.groupid ?? (`nodered_kafka_client_${uuid4()}`);
-
-            const effective = {
-                clientOpts,
-                groupOpts: {
-                    kafkaHost: clientOpts.kafkaHost,  // kafka-node reads from group options as well
-                    groupId,
-                    fromOffset: mcfg.fromOffset ?? config.fromOffset ?? 'latest',
-                    outOfRangeOffset: mcfg.outOfRangeOffset ?? config.outOfRangeOffset ?? 'earliest',
-                    fetchMinBytes: coerceNumber(mcfg.minbytes ?? config.minbytes, 1),
-                    fetchMaxBytes: coerceNumber(mcfg.maxbytes ?? config.maxbytes, 1048576),
-                    encoding: mcfg.encoding ?? config.encoding ?? 'utf8',
-                    // pass-through extra options if provided
-                    sessionTimeout: coerceNumber(mcfg.sessionTimeout, undefined),
-                    protocol: mcfg.protocol,
-                    id: mcfg.clientId
-                },
-                topic
+                return null;
             };
-            // prune undefineds to keep stable JSON for shallowEqual
-            Object.keys(effective.groupOpts).forEach(k => (effective.groupOpts[k] === undefined) && delete effective.groupOpts[k]);
-            return effective;
+            return pick(mcfg.kafkaHost)
+                || pick(mcfg.bootstrapServers)
+                || pick(mcfg['bootstrap.servers'])
+                || pick(mcfg.brokers)
+                || pick(mcfg.servers)
+                || pick(mcfg.hosts)
+                || pick(brokerOptions && (brokerOptions.kafkaHost || brokerOptions.bootstrapServers || brokerOptions['bootstrap.servers']));
+        }
+        function stableShape(eff){
+            // Keep only connection-critical fields + topic to decide rebuild
+            const g = eff.groupOpts || {};
+            const c = eff.clientOpts || {};
+            const shape = {
+                kafkaHost: c.kafkaHost,
+                groupId: g.groupId,
+                fromOffset: g.fromOffset,
+                outOfRangeOffset: g.outOfRangeOffset,
+                fetchMinBytes: g.fetchMinBytes,
+                fetchMaxBytes: g.fetchMaxBytes,
+                encoding: g.encoding,
+                sessionTimeout: g.sessionTimeout,
+                protocol: g.protocol,
+                clientId: g.id,
+                topic: eff.topic
+            };
+            // prune undefined for stable JSON comparison
+            Object.keys(shape).forEach(k => (shape[k] === undefined) && delete shape[k]);
+            return shape;
         }
 
-        function destroyConsumer(){
-            node._ready = false;
-            if (node._interval){ clearInterval(node._interval); node._interval = null; }
-            if (node._group){
-                try {
-                    node._group.removeAllListeners('connect');
-                    node._group.removeAllListeners('message');
-                    node._group.removeAllListeners('error');
-                    node._group.removeAllListeners('offsetOutOfRange');
-                } catch(_){}
-                try { node._group.close(true, ()=>{}); } catch(_){}
-                node._group = null;
+        function safeStatus(s) {
+            try {
+                node.status(s);
+            } catch (ex) {
+                // ignore
             }
         }
 
-        function ensureConsumer(eff){
-            // If not ready or config changed -> rebuild
-            if (!node._ready || !shallowEqual(node._activeCfg, eff)){
-                destroyConsumer();
-                node._activeCfg = eff;
+        function resolveCfg(msg) {
+            const mcfg = msg.kafkaCfg || {};
+            const brokerOptions = (node.broker && node.broker.options) || {};
 
-                // no broker info yet? do not throw; wait for next msg
-                const hasBroker = eff.clientOpts && (eff.clientOpts.kafkaHost || eff.clientOpts.host || eff.clientOpts.connectionString);
-                if (!hasBroker){
-                    safeStatus({ fill:'yellow', shape:'ring', text:'waiting for kafkaCfg.kafkaHost' });
-                    return false;
-                }
-                // no topic yet? also just wait, do not error
-                if (!eff.topic){
-                    safeStatus({ fill:'yellow', shape:'ring', text:'waiting for topic' });
-                    return false;
-                }
+            const groupOpts = {
+                groupId: mcfg.groupId || node.groupid || "default-group",
+                fromOffset: mcfg.fromOffset || node.fromOffset,
+                outOfRangeOffset: mcfg.outOfRangeOffset || node.outOfRangeOffset,
+                fetchMinBytes: mcfg.minbytes || node.minbytes,
+                fetchMaxBytes: mcfg.maxbytes || node.maxbytes,
+                encoding: mcfg.encoding || node.encoding,
+                sessionTimeout: mcfg.sessionTimeout,
+                protocol: mcfg.protocol,
+                id: mcfg.id
+            };
 
+            const clientOpts = Object.assign({}, brokerOptions, mcfg.kafkaClientOptions || {});
+            const normalizedHost = normalizeKafkaHost(mcfg, brokerOptions);
+            if (normalizedHost) clientOpts.kafkaHost = normalizedHost;
+            Object.keys(clientOpts).forEach(k => (clientOpts[k] === undefined) && delete clientOpts[k]);
+
+            const topic = msg.topic || node.topic || mcfg.topic;
+
+            return { groupOpts, clientOpts, topic };
+        }
+
+        function destroyConsumer() {
+            if (node._group) {
                 try {
-                    node._group = new kafka.ConsumerGroup(Object.assign({}, eff.groupOpts), eff.topic);
+                    node._group.close(true, () => {});
+                } catch (ex) {}
+                node._group = null;
+                node._ready = false;
+                safeStatus({});
+            }
+        }
+
+        function ensureConsumer(eff) {
+            const nextShape = stableShape(eff);
+            if (!node._ready || !shallowEqual(node._activeCfg, nextShape)){
+                destroyConsumer();
+                node._activeCfg = nextShape;
+                node._gen += 1;
+                const myGen = node._gen;
+                try {
+                    node._group = new ConsumerGroup(Object.assign({}, eff.groupOpts, { kafkaHost: eff.clientOpts.kafkaHost }), eff.topic);
                 } catch (e){
                     safeStatus({ fill:'red', shape:'ring', text:'init failed' });
                     node.warn(e);
+                    // revert gen increment so next message can try to re-init
+                    node._gen -= 1;
                     return false;
                 }
-
                 node._group.on('connect', () => {
+                    if (myGen !== node._gen) return; // stale
                     node._ready = true;
                     node._lastMessageTs = Date.now();
                     safeStatus({ fill:'green', shape:'dot', text:'Ready' });
                 });
                 node._group.on('message', (message) => {
+                    if (myGen !== node._gen) return; // stale
                     node._lastMessageTs = Date.now();
                     node.status({ fill:'blue', shape:'dot', text:'Reading' });
                     node.send({ payload: message });
                 });
                 node._group.on('error', (err) => {
+                    if (myGen !== node._gen) return; // stale
                     node._ready = false;
                     node._lastMessageTs = null;
                     safeStatus({ fill:'red', shape:'ring', text: (err && err.message) ? err.message : 'Error' });
                     node.warn(err);
                 });
                 node._group.on('offsetOutOfRange', (err) => {
+                    if (myGen !== node._gen) return; // stale
                     safeStatus({ fill:'yellow', shape:'ring', text:'offsetOutOfRange' });
                     node.warn(err);
                 });
-
-                node._interval = setInterval(() => {
-                    if (node._lastMessageTs != null){
-                        const diff = Date.now() - node._lastMessageTs;
-                        if (diff > 5000){
-                            safeStatus({ fill:'yellow', shape:'ring', text:'Idle' });
-                        }
-                    }
-                }, 1000);
             }
-            return node._ready;
+            return true;
         }
 
-        node.on('input', function(msg, send, done){
-            try {
-                const eff = resolveCfg(msg);
-                ensureConsumer(eff);
-                done && done();
-            } catch (e){
-                safeStatus({ fill:'red', shape:'ring', text:'Unhandled error' });
-                node.error(e, msg);
-                done && done(e);
+        node.on('input', function(msg) {
+            const eff = resolveCfg(msg);
+            if (!eff.topic) {
+                node.warn("No topic specified");
+                return;
+            }
+            if (!ensureConsumer(eff)) {
+                return;
             }
         });
 
-        node.on('close', function(){
+        node.on('close', function() {
             destroyConsumer();
-            safeStatus({});
+            if (node._interval) {
+                clearInterval(node._interval);
+                node._interval = null;
+            }
         });
-
-        // do not auto-init here; wait for first msg so editor can remain empty without errors
     }
 
-    RED.nodes.registerType('zkafka-consumer', KafkaConsumerNode);
-}
+    RED.nodes.registerType("zkafka-consumer", KafkaConsumerNode);
+};
