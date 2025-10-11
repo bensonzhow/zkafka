@@ -59,7 +59,7 @@ Topic name of selected broker which is wanted to be consume
 
 ## Installation
 ```
-npm install node-red-contrib-kafka-client
+npm install node-red-zkafka
 ```
 
 ## Usage
