@@ -1,0 +1,43 @@
+{
+    "name": "node-red-zkafka",
+    "version": "0.1.0",
+    "description": "Node-RED Kafka Consumer and Producer",
+    "node-red": {
+        "nodes": {
+            "kafka-consumer": "./js/kafka-consumer.js",
+            "kafka-producer": "./js/kafka-producer.js",
+            "kafka-broker": "./js/kafka-broker.js"
+        },
+        "keywords":[
+            "kafka-producer",
+            "kafka-consumer",
+            "node-red",
+            "kafka-broker",
+            "kafka-node",
+            "big-data",
+            "data"
+        ]
+    },
+    "keywords": [
+        "kafka-producer",
+        "kafka-consumer",
+        "node-red",
+        "kafka-broker",
+        "kafka-node",
+        "big-data",
+        "data"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/bensonzhow/zkafka.git"
+    },
+    "author": "emrebekar",
+    "bugs": {
+        "url": "https://github.com/bensonzhow/zkafka/issues"
+    },
+    "homepage": "https://github.com/bensonzhow/zkafka/blob/master/README.md",
+    "license": "MIT",
+    "dependencies": {
+        "kafka-node": "^5.0.0"
+    }
+}
