@@ -184,7 +184,7 @@ module.exports = function (RED) {
                     node._ready = false;
                     node._lastMessageTs = null;
                     safeStatus({ fill: 'red', shape: 'ring', text: (err && err.message) ? err.message : 'Error' });
-                    node.error(err);
+                    node.error(err, msg);
                 };
                 node._onReady = function () {
                     node._ready = true;
